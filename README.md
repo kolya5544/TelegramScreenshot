@@ -63,6 +63,19 @@ To stop the watcher and remove its startup entry completely, double-click:
 remove-startup-persistent.bat
 ```
 
+### Why hidden Telegram windows are left untouched
+
+Telegram owns hidden helper windows (`Qt6120ScreenChangeObserverWindow` and
+`Qt6120ThemeChangeObserverWindow`, both 1440x759 at cascade positions) that are
+never visible. TelegramScreenshot never calls `SetWindowDisplayAffinity` on
+them. That call makes the desktop compositor create a redirection surface even
+for a window that was never shown, and the orphaned surface is then presented
+as a solid white rectangle above the desktop wallpaper and below all other
+windows, click-through and impossible to dismiss, until Telegram exits. Only
+windows that already report a non-zero capture affinity are cleared; an
+unpatched Telegram reports `WDA_NONE` on every window, so the usual case
+touches nothing at all.
+
 ---
 
 ## 🧱 Requirements

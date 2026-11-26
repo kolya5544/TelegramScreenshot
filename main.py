@@ -176,6 +176,11 @@ user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
 user32.EnumWindows.restype = wintypes.BOOL
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowDisplayAffinity.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(wintypes.DWORD),
+]
+user32.GetWindowDisplayAffinity.restype = wintypes.BOOL
 
 
 def winerror(message: str) -> OSError:
@@ -376,11 +381,37 @@ def run_remote_code(process: wintypes.HANDLE, code: bytes) -> None:
         kernel32.VirtualFreeEx(process, remote, 0, MEM_RELEASE)
 
 
+def display_affinity(hwnd: int) -> int | None:
+    """Return the window's capture affinity, or None if the query fails."""
+    value = wintypes.DWORD(0)
+    if not user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(value)):
+        return None
+    return int(value.value)
+
+
 def clear_existing_affinity(
     process: wintypes.HANDLE, pid: int, original_function: int
-) -> int:
+) -> tuple[int, int]:
+    """Clear the capture affinity of Telegram windows that still have one.
+
+    Only windows that actually report a non-zero affinity are touched. Calling
+    SetWindowDisplayAffinity makes the desktop compositor create a redirection
+    surface for the window even when it has never been shown, and such an
+    orphaned surface is presented as a solid white rectangle at the window's
+    position, above the desktop wallpaper and below all other windows, until
+    Telegram exits. Telegram owns hidden Qt helper windows
+    (Qt6120ScreenChangeObserverWindow and Qt6120ThemeChangeObserverWindow, both
+    1440x759 at cascade positions) that never carry an affinity, so filtering
+    on the current affinity keeps them untouched while a genuinely protected
+    window is still cleared.
+    """
     count = 0
+    skipped = 0
     for hwnd in telegram_windows(pid):
+        affinity = display_affinity(hwnd)
+        if affinity is None or affinity == 0:
+            skipped += 1
+            continue
         # Windows x64 ABI:
         #   sub rsp, 0x28
         #   mov rcx, hwnd              ; first argument
@@ -400,7 +431,7 @@ def clear_existing_affinity(
         )
         run_remote_code(process, code)
         count += 1
-    return count
+    return count, skipped
 
 
 def install_noop(process: wintypes.HANDLE, iat_address: int) -> int:
@@ -467,13 +498,19 @@ def patch_telegram(pid: int) -> None:
             process, image_base, "SetWindowDisplayAffinity"
         )
         if read_memory(process, original_function, len(NOOP_FUNCTION)) == NOOP_FUNCTION:
+            # Already patched: original_function is the no-op here, so it must
+            # not be called again. Clearing has to happen before install_noop
+            # for that reason.
             print(f"Telegram PID {pid} is already patched")
             return
-        cleared = clear_existing_affinity(process, pid, original_function)
+        cleared, skipped = clear_existing_affinity(process, pid, original_function)
         replacement = install_noop(process, iat_address)
         print(f"Patched Telegram PID {pid}")
         print(f"  executable: {path}")
-        print(f"  cleared {cleared} existing top-level window(s)")
+        print(
+            f"  cleared {cleared} protected window(s), "
+            f"left {skipped} window(s) without a capture affinity alone"
+        )
         print(f"  SetWindowDisplayAffinity -> no-op at 0x{replacement:X}")
     finally:
         kernel32.CloseHandle(process)
