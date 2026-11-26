@@ -510,38 +510,80 @@ def run_persistent(interval: float, pid_file: Path | None = None) -> int:
         return 0
 
     if pid_file:
-        pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(str(os.getpid()), encoding="ascii")
+        # Guarded separately: the mutex and the watcher loop come later, so an
+        # unusable PID-file path must not abort persistent mode here.
+        try:
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(os.getpid()), encoding="ascii")
+        except OSError as error:
+            print(
+                f"Could not write the PID file {pid_file}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     patched: set[int] = set()
+    failed_attempts: dict[int, int] = {}
     waiting_announced = False
-    print("Persistent mode is active. Press Ctrl+C to stop.")
-    print(f"Checking for Telegram every {interval:g} second(s).")
+    failures = 0
+    print("Persistent mode is active. Press Ctrl+C to stop.", flush=True)
+    print(f"Checking for Telegram every {interval:g} second(s).", flush=True)
 
     try:
         while True:
-            current = set(telegram_pids())
-            patched.intersection_update(current)
-
-            if not current:
-                if not waiting_announced:
-                    print("Waiting for Telegram.exe...")
-                    waiting_announced = True
-            else:
-                waiting_announced = False
-
-            for pid in sorted(current - patched):
-                try:
-                    patch_telegram(pid)
-                except Exception as error:
+            # Nothing in this loop may terminate the watcher: a single failed
+            # system call (for example CreateToolhelp32Snapshot failing with
+            # ERROR_COMMITMENT_LIMIT while Windows is busy) must only skip one
+            # poll, never end the whole process. A watcher that dies silently
+            # would leave Telegram protected until the next sign-in.
+            try:
+                current = set(telegram_pids())
+            except Exception as error:
+                failures += 1
+                if failures == 1 or failures % 30 == 0:
                     print(
-                        f"Failed to patch Telegram PID {pid}: {error}; retrying...",
+                        f"Could not enumerate processes: {error}; retrying...",
                         file=sys.stderr,
+                        flush=True,
                     )
-                else:
-                    patched.add(pid)
+            else:
+                failures = 0
+                patched.intersection_update(current)
+                for stale in [pid for pid in failed_attempts if pid not in current]:
+                    failed_attempts.pop(stale, None)
 
-            time.sleep(interval)
+                if not current:
+                    if not waiting_announced:
+                        print("Waiting for Telegram.exe...", flush=True)
+                        waiting_announced = True
+                else:
+                    waiting_announced = False
+
+                for pid in sorted(current - patched):
+                    try:
+                        patch_telegram(pid)
+                    except Exception as error:
+                        attempts = failed_attempts.get(pid, 0) + 1
+                        failed_attempts[pid] = attempts
+                        # A process that can never be patched (for example a
+                        # 32-bit Telegram build) is retried forever, so its
+                        # message is throttled instead of flooding the log.
+                        if attempts == 1 or attempts % 150 == 0:
+                            print(
+                                f"Failed to patch Telegram PID {pid} "
+                                f"(attempt {attempts}): {error}; retrying...",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                    else:
+                        failed_attempts.pop(pid, None)
+                        patched.add(pid)
+
+            # Back off while the system is unhealthy instead of hammering it.
+            if failures < 5:
+                time.sleep(interval)
+            else:
+                time.sleep(min(interval * 2 ** min(failures - 4, 5), 60.0))
     except KeyboardInterrupt:
         print("\nPersistent mode stopped.")
         return 0
@@ -555,16 +597,68 @@ def run_persistent(interval: float, pid_file: Path | None = None) -> int:
         kernel32.CloseHandle(mutex)
 
 
+class _SafeStream:
+    """Text stream whose write and flush failures never propagate.
+
+    The watcher runs without a console, so an unguarded write error (full
+    disk, log drive removed) would terminate it and leave Telegram protected
+    for the rest of the session.
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def write(self, text: str) -> int:
+        try:
+            return self._inner.write(text)
+        except Exception:
+            return len(text)
+
+    def flush(self) -> None:
+        try:
+            self._inner.flush()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        try:
+            self._inner.close()
+        except Exception:
+            pass
+
+    def writable(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str):
+        # Keep the wrapped stream's other attributes (encoding, name, isatty,
+        # ...) reachable for code that inspects sys.stdout or sys.stderr.
+        return getattr(self._inner, name)
+
+
 def configure_output(log_file: Path | None) -> None:
+    stream = None
     if log_file:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        stream = log_file.open("a", encoding="utf-8", buffering=1)
-        sys.stdout = stream
-        sys.stderr = stream
-    elif sys.stdout is None or sys.stderr is None:
+        # A failing log file (missing drive, permissions, full disk) must not
+        # kill the watcher, because nothing else reports the problem any more.
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            stream = log_file.open("a", encoding="utf-8", buffering=1)
+        except OSError as error:
+            print(f"Could not open the log file {log_file}: {error}", file=sys.stderr)
+            stream = None
+    if stream is None:
+        if sys.stdout is not None and sys.stderr is not None:
+            # A piped or detached console stream can fail on write as well
+            # (BrokenPipeError), so it gets the same protection as the log.
+            sys.stdout = _SafeStream(sys.stdout)
+            sys.stderr = _SafeStream(sys.stderr)
+            return
         stream = open(os.devnull, "w", encoding="utf-8")
-        sys.stdout = stream
-        sys.stderr = stream
+    safe = _SafeStream(stream)
+    sys.stdout = safe
+    sys.stderr = safe
 
 
 def main(argv: list[str] | None = None) -> int:

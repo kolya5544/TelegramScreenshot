@@ -52,16 +52,26 @@ Double-click:
 add-startup-persistent.bat
 ```
 
-The installer creates a per-user Windows startup entry and immediately launches
-the watcher through `pythonw.exe`. No console window remains visible.
-TelegramScreenshot will start every time you sign in and patch each new
-`Telegram.exe` process.
+The installer registers the per-user scheduled task `TelegramScreenshot` and
+immediately starts it. Its action is `pythonw.exe main.py --watch`, so no
+console window and no visible window is created at any time; the installer
+verifies the started watcher and rolls the task back again if it cannot be
+confirmed. The task runs at every sign-in, repeats every five minutes to bring
+a crashed watcher back, has no execution time limit, and keeps running on
+battery power. Each new `Telegram.exe` process is patched within two seconds.
+
+The log is `TelegramScreenshot.log` next to `main.py`; the watcher writes its
+process ID to `.telegramscreenshot.pid`.
 
 To stop the watcher and remove its startup entry completely, double-click:
 
 ```text
 remove-startup-persistent.bat
 ```
+
+That removes the scheduled task, the legacy `Run` registry value (used by older
+versions), every watcher of this `main.py`, the PID file, and the log. It exits
+with an error instead of reporting success if anything is left behind.
 
 ---
 
